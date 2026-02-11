@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import albumentations as A
+import albumentations as A  
 from albumentations.pytorch import ToTensorV2
 
 # Constants
@@ -37,9 +37,15 @@ def create_validation_split(grain_type, val_ratio=0.15, random_state=42, restore
     Returns:
         dict: Statistics about the split for each category
     """
+
+    # Guard to check if validation split already exists
     base_path = Path(f"./dataset/images/{grain_type}")
     train_path = base_path / "train"
     val_path = base_path / "val"
+
+    if val_path.exists() and any(val_path.iterdir()):
+        print(f"Validation split already exists for {grain_type}, skipping.")
+        return {}
     
     categories = CATEGORIES_MAP[grain_type]
     split_stats = {}
@@ -133,7 +139,8 @@ def get_augmentation_pipeline(split='train', img_size=224):
 
             # for training only - add augmentations and randomize it so that it doesnt end up overfitted
             A.RandomRotate90(p=0.5),
-            A.Flip(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),    # shifts the hue, saturation and brightness. Bc irl the pictures will be taken in diff lighting conditions
             A.GaussNoise(var_limit=(10.0, 30.0), p=0.2),                                                # gaussion noise is like random pixels to match imperfections that can happen irl
@@ -148,7 +155,119 @@ def get_augmentation_pipeline(split='train', img_size=224):
             ToTensorV2()
         ])
 
+""" 
+Oversampling fix for class imbalance in the training set.
+"""
+def augment_minority_classes(grain_type, target_count=None, random_state=42):
+    """
+    Oversample minority classes in the training set by generating augmented copies.
 
+    Augmented images are saved back into the same training category folder with
+    an 'aug_' prefix so they're distinguishable from originals.
+
+    Args:
+        grain_type (str): Either 'maize' or 'rice'
+        target_count (int): Number of images to reach per class.
+                            Defaults to the count of the largest class.
+        random_state (int): Random seed for reproducibility
+
+    Returns:
+        dict: How many images were generated per category
+    """
+    np.random.seed(random_state)
+
+    categories = CATEGORIES_MAP[grain_type]
+    train_path = Path(f"./dataset/images/{grain_type}/train")
+
+    # Count existing images per category
+    counts = {}
+    for category in categories:
+        cat_path = train_path / category
+        if cat_path.exists():
+            counts[category] = len(list(cat_path.glob("*.png")))
+        else:
+            counts[category] = 0
+
+    # Guard to check if augmentation has already been run
+    already_augmented = any(
+        list(cat_path.glob("aug_*.png"))
+        for category in categories
+        for cat_path in [(train_path / category)]
+        if cat_path.exists()
+    )
+    if already_augmented:
+        print(f"Augmented files already exist for {grain_type}, skipping.")
+        print(f"To re-run, manually delete files with the aug_ prefix from train/ first.\n")
+        return {}
+
+    # Default target: match the largest class
+    if target_count is None:
+        target_count = max(counts.values())
+
+    print(f"\nAugmenting minority classes for {grain_type.upper()}...")
+    print(f"Target count per class: {target_count}")
+    print(f"Current counts: {counts}\n")
+
+    # Augmentation pipeline for generating new images —
+    # more aggressive than training pipeline since we want variety
+    aug = A.Compose([
+        A.RandomRotate90(p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=15, p=0.5),
+        A.GaussNoise(var_limit=(10.0, 40.0), p=0.3),
+        A.Rotate(limit=15, p=0.4),  # slight non-90 rotation for more variety
+    ])
+
+    generated_counts = {}
+
+    for category in categories:
+        cat_path = train_path / category
+        current_count = counts[category]
+
+        if current_count == 0:
+            print(f"  {category}: No images found, skipping.")
+            generated_counts[category] = 0
+            continue
+
+        if current_count >= target_count:
+            print(f"  {category}: Already has {current_count} images, no augmentation needed.")
+            generated_counts[category] = 0
+            continue
+
+        needed = target_count - current_count
+        images = list(cat_path.glob("*.png"))
+
+        print(f"  {category}: {current_count} images → generating {needed} more...")
+
+        generated = 0
+        with tqdm(total=needed, desc=f"  {category}", leave=False) as pbar:
+            while generated < needed:
+                # Pick a random source image to augment
+                src_path = images[np.random.randint(len(images))]
+                img = cv2.imread(str(src_path))
+
+                if img is None:
+                    continue
+
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                augmented = aug(image=img_rgb)['image']
+                augmented_bgr = cv2.cvtColor(augmented, cv2.COLOR_RGB2BGR)
+
+                # Save with aug_ prefix and index so filenames don't collide
+                out_name = f"aug_{generated:05d}_{src_path.name}"
+                out_path = cat_path / out_name
+                cv2.imwrite(str(out_path), augmented_bgr)
+
+                generated += 1
+                pbar.update(1)
+
+        generated_counts[category] = generated
+        print(f"  {category}: Done. Now has {current_count + generated} images.")
+
+    print(f"\nAugmentation complete for {grain_type.upper()}.")
+    return generated_counts
 
 """ Basically same as the last one but no normalization and tensor conversion, 
 its just to visualize stuff in the ntbk and to check if the augmentations are working as expected. """
@@ -167,7 +286,8 @@ def get_augmentation_pipeline_no_tensor(split='train', img_size=224):
         return A.Compose([
             A.Resize(img_size, img_size),
             A.RandomRotate90(p=0.5),
-            A.Flip(p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
             A.GaussNoise(var_limit=(10.0, 30.0), p=0.2),
