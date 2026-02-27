@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import albumentations as A  
 from albumentations.pytorch import ToTensorV2
+from PIL import Image
 
 # Constants
 MAIZE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_HD", "7_IM"]
@@ -21,6 +22,19 @@ CATEGORIES_MAP = {
     "rice": RICE_CATEGORIES
 }
 
+""" Resize the aspect ratio and add padding """
+def letterbox(img, size=224):
+
+    w, h = img.size
+    scale = size / max(w, h)
+    nw, nh = int(w * scale), int(h * scale)
+    img = img.resize((nw, nh), Image.BILINEAR)
+
+    canvas = Image.new("RGB", (size, size), (0, 0, 0))
+    paste_x = (size - nw) // 2
+    paste_y = (size - nh) // 2
+    canvas.paste(img, (paste_x, paste_y))
+    return canvas
 
 
 """ required to have a validation split in the specs """
