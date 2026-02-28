@@ -23,7 +23,7 @@ CATEGORIES_MAP = {
 }
 
 """ Resize the aspect ratio and add padding """
-def letterbox(img, size=224):
+def letterbox(img, size=240):
 
     w, h = img.size
     scale = size / max(w, h)
