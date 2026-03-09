@@ -84,7 +84,7 @@ class LightningModel(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, true_labels, predicted_labels = self._shared_step(batch)
 
-        self.log("val_loss", loss)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True, on_step=False)
         self.val_acc(predicted_labels, true_labels)
         self.log("val_acc", self.val_acc, prog_bar=True, on_epoch=True, on_step=False)
 
@@ -118,7 +118,7 @@ class LightningModel(L.LightningModule):
 
     def configure_optimizers(self):
         # Only optimize parameters that require gradients
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
 
