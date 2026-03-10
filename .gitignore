@@ -1,5 +1,7 @@
 /dataset
 /models
+/checkpoints
+/logs
 
 .vscode
 

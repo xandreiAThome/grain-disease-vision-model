@@ -8,6 +8,7 @@ from torchvision import transforms
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
+from torch.utils.data import WeightedRandomSampler
 
 MAIZE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_HD", "7_IM"]
 RICE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_UN", "7_IM"]
@@ -25,27 +26,32 @@ IDX_TO_CLASS = {v: k for k, v in CLASS_TO_IDX.items()}
 
 
 class LightningModel(L.LightningModule):
-    def __init__(self, model, learning_rate, num_classes):
+    def __init__(self, model, learning_rate, num_classes, cosine_t_max):
         super().__init__()
 
         self.learning_rate = learning_rate
         self.model = model
+        self.cosine_t_max = cosine_t_max
 
         self.train_acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=num_classes
         )
         self.val_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.val_macro_f1 = torchmetrics.F1Score(
+            task="multiclass", num_classes=num_classes, average="macro"
+        )
+
         self.test_acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=num_classes
         )
-        self.test_precision = torchmetrics.Precision(
-            task="multiclass", num_classes=num_classes, average="weighted"
+        self.test_macro_precision = torchmetrics.Precision(
+            task="multiclass", num_classes=num_classes, average="macro"
         )
-        self.test_recall = torchmetrics.Recall(
-            task="multiclass", num_classes=num_classes, average="weighted"
+        self.test_macro_recall = torchmetrics.Recall(
+            task="multiclass", num_classes=num_classes, average="macro"
         )
-        self.test_f1 = torchmetrics.F1Score(
-            task="multiclass", num_classes=num_classes, average="weighted"
+        self.test_macro_f1 = torchmetrics.F1Score(
+            task="multiclass", num_classes=num_classes, average="macro"
         )
         self.test_precision_per_class = torchmetrics.Precision(
             task="multiclass", num_classes=num_classes, average=None
@@ -87,39 +93,66 @@ class LightningModel(L.LightningModule):
         self.log("val_loss", loss, prog_bar=True, on_epoch=True, on_step=False)
         self.val_acc(predicted_labels, true_labels)
         self.log("val_acc", self.val_acc, prog_bar=True, on_epoch=True, on_step=False)
+        self.val_macro_f1(predicted_labels, true_labels)
+        self.log(
+            "val_macro_f1",
+            self.val_macro_f1,
+            prog_bar=True,
+            on_epoch=True,
+            on_step=False,
+        )
 
     def test_step(self, batch, batch_idx):
         _, true_labels, predicted_labels = self._shared_step(batch)
 
         self.test_acc(predicted_labels, true_labels)
-        self.test_precision(predicted_labels, true_labels)
-        self.test_recall(predicted_labels, true_labels)
-        self.test_f1(predicted_labels, true_labels)
+        self.test_macro_precision(predicted_labels, true_labels)
+        self.test_macro_recall(predicted_labels, true_labels)
+        self.test_macro_f1(predicted_labels, true_labels)
         self.test_precision_per_class(predicted_labels, true_labels)
         self.test_recall_per_class(predicted_labels, true_labels)
         self.test_f1_per_class(predicted_labels, true_labels)
 
         self.log("test_acc", self.test_acc, metric_attribute="test_acc")
         self.log(
-            "test_precision", self.test_precision, metric_attribute="test_precision"
+            "test_macro_precision",
+            self.test_macro_precision,
+            metric_attribute="test_macro_precision",
         )
-        self.log("test_recall", self.test_recall, metric_attribute="test_recall")
-        self.log("test_f1", self.test_f1, metric_attribute="test_f1")
+        self.log(
+            "test_macro_recall",
+            self.test_macro_recall,
+            metric_attribute="test_macro_recall",
+        )
+        self.log("test_macro_f1", self.test_macro_f1, metric_attribute="test_macro_f1")
 
-        # Log per-class metrics as plain scalars
+        # Log per-class metrics with class names
         precision_per_class = self.test_precision_per_class.compute()
         recall_per_class = self.test_recall_per_class.compute()
         f1_per_class = self.test_f1_per_class.compute()
 
         for i in range(self.num_classes):
-            self.log(f"test_precision_class_{i}", precision_per_class[i])
-            self.log(f"test_recall_class_{i}", recall_per_class[i])
-            self.log(f"test_f1_class_{i}", f1_per_class[i])
+            class_name = IDX_TO_CLASS[i]
+            self.log(f"test_precision_{class_name}", precision_per_class[i])
+            self.log(f"test_recall_{class_name}", recall_per_class[i])
+            self.log(f"test_f1_{class_name}", f1_per_class[i])
 
     def configure_optimizers(self):
         # Only optimize parameters that require gradients
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.cosine_t_max
+        )  # New!
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": sch,
+                "monitor": "train_loss",
+                "interval": "step",  # step means "batch" here, default: epoch   # New!
+                "frequency": 1,  # default
+            },
+        }
 
 
 class GrainDataset(ImageFolder):
@@ -196,12 +229,30 @@ class GrainDataModule(L.LightningDataModule):
         self.test_dataset = ConcatDataset([maize_test, rice_test])
 
     def train_dataloader(self):
+        # Weighted sampling
+        # Extract labels from all datasets in the ConcatDataset
+        all_labels = []
+        for dataset in self.train_dataset.datasets:
+            all_labels.extend(dataset.imgs)
+
+        labels = torch.tensor([label for _, label in all_labels])
+
+        class_counts = torch.bincount(labels)
+        class_weights = 1.0 / class_counts.float()
+
+        sample_weights = class_weights[labels]
+
+        sampler = WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights), replacement=True
+        )
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=False,
             drop_last=True,
             num_workers=self.num_workers,
+            sampler=sampler,
         )
 
     def val_dataloader(self):
