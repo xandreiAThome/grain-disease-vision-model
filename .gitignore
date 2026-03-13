@@ -1,5 +1,10 @@
 /dataset
 /models
+/checkpoints
+/logs
+/lightning_logs
+
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

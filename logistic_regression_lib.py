@@ -3,13 +3,10 @@ import cv2
 from pathlib import Path
 from tqdm import tqdm
 
-MAIZE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_HD", "7_IM"]
-RICE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_UN", "7_IM"]
+MAIZE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_HD"]
+RICE_CATEGORIES = ["0_NOR", "1_F&S", "2_SD", "3_MY", "4_AP", "5_BN", "6_UN"]
 
-CATEGORIES_MAP = {
-    "maize": MAIZE_CATEGORIES,
-    "rice": RICE_CATEGORIES
-}
+CATEGORIES_MAP = {"maize": MAIZE_CATEGORIES, "rice": RICE_CATEGORIES}
 
 
 def collect_embeddings(grain_type, split="train"):
@@ -56,6 +53,7 @@ def embed_features(img_path):
     mask = (s > 30) & (v > 30)
     mask = mask.astype("uint8")
 
+    # TODO: Maybe try different bin values for the histogram
     hist = cv2.calcHist([hsv], [0, 1, 2], mask, [8, 8, 8], [0, 180, 0, 256, 0, 256])
     embedding = hist.flatten() / hist.sum()
     return embedding.reshape(1, -1)
