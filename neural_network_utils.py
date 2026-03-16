@@ -40,6 +40,9 @@ class LightningModel(L.LightningModule):
         self.val_macro_f1 = torchmetrics.F1Score(
             task="multiclass", num_classes=num_classes, average="macro"
         )
+        self.val_f1_per_class = torchmetrics.F1Score(
+            task="multiclass", num_classes=num_classes, average=None
+        )
 
         self.test_acc = torchmetrics.Accuracy(
             task="multiclass", num_classes=num_classes
@@ -64,6 +67,12 @@ class LightningModel(L.LightningModule):
         )
         self.num_classes = num_classes
 
+        # Store predictions and targets for epoch-end logging (like confusion matrix)
+        self.val_preds = []
+        self.val_targets = []
+        self.test_preds = []
+        self.test_targets = []
+
     def forward(self, x):
         return self.model(x)
 
@@ -71,7 +80,9 @@ class LightningModel(L.LightningModule):
         features, true_labels = batch
         logits = self(features)
 
-        loss = F.cross_entropy(logits, true_labels)
+        # Apply label smoothing (class weights kept optional as in your draft)
+        loss = F.cross_entropy(logits, true_labels, label_smoothing=0.1)
+
         predicted_labels = torch.argmax(logits, dim=1)
 
         return loss, true_labels, predicted_labels
@@ -102,9 +113,51 @@ class LightningModel(L.LightningModule):
             on_step=False,
         )
 
+        self.val_f1_per_class(predicted_labels, true_labels)
+
+        # Store for epoch-end logging
+        self.val_preds.append(predicted_labels.detach().cpu())
+        self.val_targets.append(true_labels.detach().cpu())
+
+    def on_validation_epoch_end(self):
+        if not self.val_preds or not self.val_targets:
+            return
+
+        f1_per_class = self.val_f1_per_class.compute()
+        for class_idx in range(self.num_classes):
+            class_name = IDX_TO_CLASS[class_idx]
+            self.log(f"val_f1_{class_name}", f1_per_class[class_idx])
+
+        # Reset the metric for the next epoch
+        self.val_f1_per_class.reset()
+
+        # Concatenate all stored predictions and targets for Comet
+        preds = torch.cat(self.val_preds).numpy()
+        targets = torch.cat(self.val_targets).numpy()
+
+        # Access the Comet logger via self.loggers
+        if self.loggers:
+            for logger in self.loggers:
+                if hasattr(logger, "experiment") and hasattr(
+                    logger.experiment, "log_confusion_matrix"
+                ):
+                    labels = [IDX_TO_CLASS[i] for i in range(self.num_classes)]
+                    logger.experiment.log_confusion_matrix(
+                        y_true=targets,
+                        y_predicted=preds,
+                        labels=labels,
+                        title=f"Validation Confusion Matrix Epoch {self.current_epoch}",
+                        file_name=f"val_confusion_matrix_epoch_{self.current_epoch}.json",
+                    )
+
+        # Clear paths to prevent memory leaks
+        self.val_preds.clear()
+        self.val_targets.clear()
+
     def test_step(self, batch, batch_idx):
         _, true_labels, predicted_labels = self._shared_step(batch)
 
+        # Just update the metrics
         self.test_acc(predicted_labels, true_labels)
         self.test_macro_precision(predicted_labels, true_labels)
         self.test_macro_recall(predicted_labels, true_labels)
@@ -113,20 +166,20 @@ class LightningModel(L.LightningModule):
         self.test_recall_per_class(predicted_labels, true_labels)
         self.test_f1_per_class(predicted_labels, true_labels)
 
-        self.log("test_acc", self.test_acc, metric_attribute="test_acc")
-        self.log(
-            "test_macro_precision",
-            self.test_macro_precision,
-            metric_attribute="test_macro_precision",
-        )
-        self.log(
-            "test_macro_recall",
-            self.test_macro_recall,
-            metric_attribute="test_macro_recall",
-        )
-        self.log("test_macro_f1", self.test_macro_f1, metric_attribute="test_macro_f1")
+        # Log scalar metrics directly
+        self.log("test_acc", self.test_acc)
+        self.log("test_macro_precision", self.test_macro_precision)
+        self.log("test_macro_recall", self.test_macro_recall)
+        self.log("test_macro_f1", self.test_macro_f1)
 
-        # Log per-class metrics with class names
+        # Store for epoch-end logging
+        self.test_preds.append(predicted_labels.detach().cpu())
+        self.test_targets.append(true_labels.detach().cpu())
+
+    def on_test_epoch_end(self):
+        if not self.test_preds or not self.test_targets:
+            return
+
         precision_per_class = self.test_precision_per_class.compute()
         recall_per_class = self.test_recall_per_class.compute()
         f1_per_class = self.test_f1_per_class.compute()
@@ -137,20 +190,43 @@ class LightningModel(L.LightningModule):
             self.log(f"test_recall_{class_name}", recall_per_class[i])
             self.log(f"test_f1_{class_name}", f1_per_class[i])
 
+        self.test_precision_per_class.reset()
+        self.test_recall_per_class.reset()
+        self.test_f1_per_class.reset()
+
+        preds = torch.cat(self.test_preds).numpy()
+        targets = torch.cat(self.test_targets).numpy()
+
+        if self.loggers:
+            for logger in self.loggers:
+                if hasattr(logger, "experiment") and hasattr(
+                    logger.experiment, "log_confusion_matrix"
+                ):
+                    labels = [IDX_TO_CLASS[i] for i in range(self.num_classes)]
+                    logger.experiment.log_confusion_matrix(
+                        y_true=targets,
+                        y_predicted=preds,
+                        labels=labels,
+                        title="Test Confusion Matrix",
+                    )
+
+        self.test_preds.clear()
+        self.test_targets.clear()
+
     def configure_optimizers(self):
         # Only optimize parameters that require gradients
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.cosine_t_max
-        )  # New!
+        )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": sch,
                 "monitor": "train_loss",
-                "interval": "step",  # step means "batch" here, default: epoch   # New!
-                "frequency": 1,  # default
+                "interval": "step",
+                "frequency": 1,
             },
         }
 
@@ -229,17 +305,20 @@ class GrainDataModule(L.LightningDataModule):
         self.test_dataset = ConcatDataset([maize_test, rice_test])
 
     def train_dataloader(self):
-        # Weighted sampling
-        # Extract labels from all datasets in the ConcatDataset
-        all_labels = []
-        for dataset in self.train_dataset.datasets:
-            all_labels.extend(dataset.imgs)
-
-        labels = torch.tensor([label for _, label in all_labels])
-
-        class_counts = torch.bincount(labels)
+        # Weighted sampling with proper global label mapping
+        class_counts = _count_class_samples(self.train_dataset, len(CLASS_TO_IDX))
         class_weights = 1.0 / class_counts.float()
 
+        # Extract labels for each sample to map to weights
+        all_labels = []
+        for dataset in self.train_dataset.datasets:
+            for img_path, local_label in dataset.imgs:
+                class_name = dataset.classes[local_label]
+                full_label = f"{dataset.grain_type}_{class_name}"
+                global_label = CLASS_TO_IDX[full_label]
+                all_labels.append(global_label)
+
+        labels = torch.tensor(all_labels)
         sample_weights = class_weights[labels]
 
         sampler = WeightedRandomSampler(
@@ -301,3 +380,16 @@ def plot_loss_and_acc(
     plt.ylim(acc_ylim)
     if save_acc is not None:
         plt.savefig(save_acc)
+
+
+def _count_class_samples(train_dataset, num_classes):
+    class_counts = torch.zeros(num_classes)
+
+    for dataset in train_dataset.datasets:
+        for img_path, local_label in dataset.imgs:
+            class_name = dataset.classes[local_label]
+            full_label = f"{dataset.grain_type}_{class_name}"
+            global_label = CLASS_TO_IDX[full_label]
+            class_counts[global_label] += 1
+
+    return class_counts
